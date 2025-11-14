@@ -1,0 +1,22 @@
+# ============================================================================
+# REQUIRED - Core Functionality
+# ============================================================================
+
+# FastAPI and Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+pydantic==2.5.0
+
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+
+# Excel Processing
+openpyxl==3.1.2
+
+# PDF Processing (Azure) - NEW PACKAGE
+azure-ai-documentintelligence==1.0.0b4  # ← New official package
+
+# Utilities
+python-dotenv==1.0.0

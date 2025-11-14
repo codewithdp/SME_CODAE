@@ -1,0 +1,90 @@
+# Simplified Docker Compose - No Redis, No Celery!
+# Just PostgreSQL database and your application
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: reconciliation-postgres
+    environment:
+      POSTGRES_DB: reconciliation
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Backend API (FastAPI with Background Tasks)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: reconciliation-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:-postgres}@postgres:5432/reconciliation
+      
+      # Azure Document Intelligence
+      AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${AZURE_DI_ENDPOINT}
+      AZURE_DOCUMENT_INTELLIGENCE_KEY: ${AZURE_DI_KEY}
+      
+      # Azure Storage (optional)
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING:-}
+      AZURE_STORAGE_CONTAINER: ${AZURE_STORAGE_CONTAINER:-reconciliation-files}
+      
+      # Processing settings
+      MIN_PDF_CONFIDENCE: ${MIN_PDF_CONFIDENCE:-0.75}
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-50}
+      
+      # File storage
+      UPLOAD_DIR: /app/uploads
+      REPORTS_DIR: /app/reports
+    volumes:
+      # Mount code for development (comment out for production)
+      - ./backend:/app
+      
+      # Persistent storage for uploads and reports
+      - uploads_data:/app/uploads
+      - reports_data:/app/reports
+    restart: unless-stopped
+    command: uvicorn app.simplified_main_api:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend (React)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: reconciliation-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  uploads_data:
+    driver: local
+  reports_data:
+    driver: local
+
+networks:
+  default:
+    name: reconciliation-network
