@@ -18,5 +18,11 @@ openpyxl==3.1.2
 # PDF Processing (Azure) - NEW PACKAGE
 azure-ai-documentintelligence==1.0.0b4  # ← New official package
 
+# Azure Blob Storage (for bulk upload feature)
+azure-storage-blob==12.19.0
+
+# PDF Manipulation (for splitting/combining PDFs)
+PyPDF2==3.0.1
+
 # Utilities
 python-dotenv==1.0.0
