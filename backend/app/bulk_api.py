@@ -31,6 +31,7 @@ from .blob_storage_service import BlobStorageService
 from .reconciliation_engine_comprehensive import ComprehensiveReconciliationEngine
 from .excel_parser_custom import CustomExcelParser
 from .pdf_processor import PDFProcessor
+from .main import ReconciliationDB
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,8 @@ class BulkUpload(Base):
     blob_path = Column(String(500))
     processing_started_at = Column(DateTime)
     processing_completed_at = Column(DateTime)
+    progress_percentage = Column(Integer, default=0)
+    current_step = Column(String(255))
     error_message = Column(Text)
     retention_until = Column(DateTime)
     user_id = Column(String(100))
@@ -159,11 +162,17 @@ async def process_bulk_pdf_background(
         upload = db.query(BulkUpload).filter(BulkUpload.id == upload_id).first()
         upload.status = "processing"
         upload.processing_started_at = datetime.now()
+        upload.progress_percentage = 5
+        upload.current_step = "Iniciando processamento..."
         db.commit()
 
         logger.info(f"Starting background processing for upload {upload_id}")
 
         # Step 1: Upload original PDF to blob storage
+        upload.progress_percentage = 10
+        upload.current_step = "Fazendo upload do PDF..."
+        db.commit()
+
         blob_folder = f"{datetime.now().strftime('%Y-%m')}/{upload_id}"
         original_blob_path = blob_service.upload_file(
             file_data=io.BytesIO(pdf_content),
@@ -175,6 +184,8 @@ async def process_bulk_pdf_background(
 
         # Update blob path
         upload.blob_path = original_blob_path
+        upload.progress_percentage = 20
+        upload.current_step = "Analisando documento com Azure AI..."
         db.commit()
 
         # Step 2: Process PDF with custom model
@@ -187,7 +198,12 @@ async def process_bulk_pdf_background(
         )
 
         # Step 3: Save each extracted document
+        upload.progress_percentage = 60
+        upload.current_step = f"Salvando {result.total_documents} documentos extraídos..."
+        db.commit()
+
         documents_with_2_pages = 0
+        saved_count = 0
 
         for doc in result.documents:
             # Upload individual PDF to blob
@@ -225,15 +241,26 @@ async def process_bulk_pdf_background(
             if doc.page_count == 2:
                 documents_with_2_pages += 1
 
+            saved_count += 1
+            # Update progress for each document saved (60-90%)
+            doc_progress = 60 + int((saved_count / result.total_documents) * 30)
+            upload.progress_percentage = doc_progress
+            upload.current_step = f"Documento {saved_count}/{result.total_documents} salvo: {doc.document_id}"
+            db.commit()
+
             logger.info(f"Saved document {doc.document_id} ({doc.page_count} pages)")
 
+        # Step 4: Update upload statistics
+        upload.progress_percentage = 95
+        upload.current_step = "Finalizando processamento..."
         db.commit()
 
-        # Step 4: Update upload statistics
         upload.total_pages = result.total_pages
         upload.total_documents = result.total_documents
         upload.documents_with_2_pages = documents_with_2_pages
         upload.status = "completed"
+        upload.progress_percentage = 100
+        upload.current_step = "Concluído!"
         upload.processing_completed_at = datetime.now()
         upload.retention_until = datetime.now() + timedelta(days=180)  # 6 months
 
@@ -343,20 +370,21 @@ async def get_upload_status(
     if not upload:
         raise HTTPException(status_code=404, detail="Upload not found")
 
-    # Calculate progress percentage
-    progress = 0
-    if upload.status == "processing":
-        progress = 50  # Assume 50% while processing
-    elif upload.status == "completed":
+    # Get progress from database or calculate based on status
+    progress = upload.progress_percentage or 0
+    if upload.status == "completed":
         progress = 100
     elif upload.status == "failed":
         progress = 0
+    elif upload.status == "processing" and progress == 0:
+        progress = 10  # Show some progress if none recorded yet
 
-    current_step = None
-    if upload.status == "processing":
-        current_step = "Extracting documents from PDF..."
-    elif upload.status == "completed":
-        current_step = "Complete"
+    current_step = upload.current_step
+    if not current_step:
+        if upload.status == "processing":
+            current_step = "Extracting documents from PDF..."
+        elif upload.status == "completed":
+            current_step = "Complete"
 
     return BulkUploadStatusResponse(
         id=upload.id,
@@ -418,6 +446,48 @@ async def get_uploaded_documents(
         )
         for doc in documents
     ]
+
+
+@router.get("/{upload_id}/reconciliation/{reconciliation_id}")
+async def get_reconciliation_details(
+    upload_id: UUID,
+    reconciliation_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get detailed reconciliation results for a specific document
+
+    Returns the full reconciliation report including all mismatches,
+    match percentages, and comparison details
+    """
+    # Verify upload exists
+    upload = db.query(BulkUpload).filter(BulkUpload.id == upload_id).first()
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    # Get reconciliation record
+    reconciliation = db.query(ReconciliationDB).filter(
+        ReconciliationDB.id == reconciliation_id
+    ).first()
+
+    if not reconciliation:
+        raise HTTPException(status_code=404, detail="Reconciliation not found")
+
+    # Return the full reconciliation data
+    return JSONResponse(content={
+        "id": str(reconciliation.id) if reconciliation.id else None,
+        "document_id": reconciliation.emei_id,
+        "excel_filename": reconciliation.excel_filename,
+        "pdf_filename": reconciliation.pdf_filename,
+        "status": reconciliation.status,
+        "overall_match_percentage": reconciliation.overall_match_percentage,
+        "total_mismatches": reconciliation.total_mismatches,
+        "id_match": reconciliation.id_match,
+        "pdf_confidence_ok": reconciliation.pdf_confidence_ok,
+        "result_data": reconciliation.result_data,
+        "created_at": reconciliation.created_at.isoformat() if reconciliation.created_at else None,
+        "completed_at": reconciliation.completed_at.isoformat() if reconciliation.completed_at else None
+    })
 
 
 @router.get("/{upload_id}", response_model=BulkUploadResponse)
@@ -560,6 +630,12 @@ async def upload_excel_files(
                 doc.excel_uploaded_at = datetime.now()
                 doc.status = "ready"  # Ready for reconciliation
 
+                # Clear any previous reconciliation data
+                doc.reconciliation_status = None
+                doc.reconciliation_id = None
+                doc.reconciliation_match_percentage = None
+                doc.reconciliation_total_mismatches = None
+
                 matched_count += 1
                 matched_ids.append(file_base)
 
@@ -587,3 +663,261 @@ async def upload_excel_files(
         matched_documents=matched_ids,
         missing_documents=missing_ids
     )
+
+
+# ============================================================================
+# BATCH RECONCILIATION ENDPOINT
+# ============================================================================
+
+@router.post("/{upload_id}/reconcile")
+async def start_batch_reconciliation(
+    upload_id: UUID,
+    request: ReconcileRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Start batch reconciliation for selected documents
+    Processes PDF + Excel for each document in background
+    """
+    try:
+        # Verify upload exists
+        upload = db.query(BulkUpload).filter(BulkUpload.id == upload_id).first()
+        if not upload:
+            raise HTTPException(status_code=404, detail="Upload not found")
+
+        # Get documents to reconcile (either specified or all "ready" documents)
+        if request.document_ids:
+            documents = db.query(BulkDocument).filter(
+                BulkDocument.bulk_upload_id == upload_id,
+                BulkDocument.document_id.in_(request.document_ids),
+                BulkDocument.status == "ready"
+            ).all()
+        else:
+            # If no document_ids specified, reconcile all ready documents
+            documents = db.query(BulkDocument).filter(
+                BulkDocument.bulk_upload_id == upload_id,
+                BulkDocument.status == "ready"
+            ).all()
+
+        if not documents:
+            raise HTTPException(
+                status_code=400,
+                detail="No ready documents found for reconciliation"
+            )
+
+        # Update document status to "reconciling"
+        for doc in documents:
+            doc.status = "reconciling"
+            doc.reconciliation_status = "processing"
+        db.commit()
+
+        # Start background task
+        background_tasks.add_task(
+            process_batch_reconciliation,
+            str(upload_id),
+            [doc.document_id for doc in documents]
+        )
+
+        return {
+            "message": "Batch reconciliation started",
+            "upload_id": str(upload_id),
+            "document_count": len(documents),
+            "document_ids": [doc.document_id for doc in documents]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting batch reconciliation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def process_batch_reconciliation(upload_id: str, document_ids: List[str]):
+    """
+    Background task to reconcile multiple documents
+    Downloads PDFs and Excel files, runs reconciliation, saves results
+    """
+    db = SessionLocal()
+
+    try:
+        logger.info(f"Starting batch reconciliation for upload {upload_id}, {len(document_ids)} documents")
+
+        # Initialize blob storage and services
+        connection_string = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
+        blob_service = BlobStorageService(connection_string, 'bulk-uploads')
+
+        # Initialize Complete Positional Reconciliation Engine (Sections 1, 2, 3)
+        azure_di_endpoint = os.getenv('AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT')
+        azure_di_key = os.getenv('AZURE_DOCUMENT_INTELLIGENCE_KEY')
+
+        from .reconciliation_engine_complete import CompletePositionalReconciliationEngine
+        from .main import transform_custom_model_results_to_reconciliation_result
+
+        recon_engine = CompletePositionalReconciliationEngine()
+        excel_parser = CustomExcelParser()
+
+        total = len(document_ids)
+        for idx, doc_id in enumerate(document_ids):
+            try:
+                logger.info(f"Processing document {idx + 1}/{total}: {doc_id}")
+
+                # Get document from database
+                doc = db.query(BulkDocument).filter(
+                    BulkDocument.bulk_upload_id == upload_id,
+                    BulkDocument.document_id == doc_id
+                ).first()
+
+                if not doc or not doc.pdf_blob_path or not doc.excel_blob_path:
+                    logger.error(f"Document {doc_id} missing PDF or Excel file")
+                    doc.status = "failed"
+                    doc.reconciliation_status = "failed"
+                    doc.error_message = "Missing PDF or Excel file"
+                    db.commit()
+                    continue
+
+                # Download PDF and Excel from blob storage
+                pdf_content = blob_service.download_file(doc.pdf_blob_path)
+                excel_content = blob_service.download_file(doc.excel_blob_path)
+
+                # Save temporarily
+                temp_dir = f"/tmp/bulk_recon_{upload_id}"
+                os.makedirs(temp_dir, exist_ok=True)
+
+                pdf_path = os.path.join(temp_dir, f"{doc_id}.pdf")
+                excel_path = os.path.join(temp_dir, f"{doc_id}.xlsm")
+
+                with open(pdf_path, 'wb') as f:
+                    f.write(pdf_content)
+                with open(excel_path, 'wb') as f:
+                    f.write(excel_content)
+
+                # Run custom model reconciliation
+                section_configs = [
+                    {"section_name": "Section2", "excel_start_row": 28},
+                    {"section_name": "Section3", "excel_start_row": 77}
+                ]
+
+                custom_results = recon_engine.reconcile_all_sections(pdf_path, excel_path, section_configs)
+
+                # Transform custom model results to ReconciliationResult format
+                result = transform_custom_model_results_to_reconciliation_result(
+                    custom_results,
+                    doc_id,
+                    doc.excel_filename,
+                    f"{doc_id}.pdf"
+                )
+
+                # Create reconciliation record in main reconciliations table
+                reconciliation = ReconciliationDB(
+                    id=str(uuid4()),
+                    excel_filename=doc.excel_filename,
+                    pdf_filename=f"{doc_id}.pdf",
+                    emei_id=doc_id,
+                    id_match=result.id_match,
+                    pdf_confidence_ok=result.pdf_confidence_ok,
+                    total_mismatches=result.total_mismatches,
+                    overall_match_percentage=result.overall_match_percentage,
+                    status="completed",
+                    result_data=json.loads(result.model_dump_json())
+                )
+                db.add(reconciliation)
+                db.flush()
+
+                # Update bulk document with reconciliation results
+                doc.reconciliation_id = reconciliation.id
+                doc.reconciliation_status = "completed"
+                doc.reconciliation_match_percentage = result.overall_match_percentage
+                doc.reconciliation_total_mismatches = result.total_mismatches
+                doc.status = "completed"
+
+                # Clean up temp files
+                os.remove(pdf_path)
+                os.remove(excel_path)
+
+                db.commit()
+                logger.info(f"✅ Completed reconciliation for {doc_id}: {result.overall_match_percentage:.2f}% match")
+
+            except Exception as e:
+                logger.error(f"❌ Error processing document {doc_id}: {e}")
+                doc.status = "failed"
+                doc.reconciliation_status = "failed"
+                doc.error_message = str(e)
+                db.commit()
+
+        # Clean up temp directory
+        try:
+            os.rmdir(temp_dir)
+        except:
+            pass
+
+        logger.info(f"✅ Batch reconciliation complete for upload {upload_id}")
+
+    except Exception as e:
+        logger.error(f"❌ Batch reconciliation failed for upload {upload_id}: {e}")
+    finally:
+        db.close()
+
+
+@router.post("/{upload_id}/reset-reconciliation")
+async def reset_reconciliation_status(
+    upload_id: UUID,
+    document_ids: Optional[List[str]] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Reset reconciliation status for documents to allow re-running reconciliation
+    without re-uploading files.
+
+    If document_ids is provided, only reset those documents.
+    Otherwise, reset all documents in the upload.
+    """
+    try:
+        # Verify upload exists
+        upload = db.query(BulkUpload).filter(BulkUpload.id == upload_id).first()
+        if not upload:
+            raise HTTPException(status_code=404, detail="Upload not found")
+
+        # Get documents to reset
+        if document_ids:
+            documents = db.query(BulkDocument).filter(
+                BulkDocument.bulk_upload_id == upload_id,
+                BulkDocument.document_id.in_(document_ids)
+            ).all()
+        else:
+            # Reset all documents
+            documents = db.query(BulkDocument).filter(
+                BulkDocument.bulk_upload_id == upload_id
+            ).all()
+
+        if not documents:
+            raise HTTPException(
+                status_code=404,
+                detail="No documents found to reset"
+            )
+
+        # Reset each document back to "ready" status
+        reset_count = 0
+        for doc in documents:
+            # Only reset if it has both PDF and Excel (was ready to reconcile before)
+            if doc.pdf_blob_path and doc.excel_blob_path:
+                doc.status = "ready"
+                doc.reconciliation_status = None
+                doc.reconciliation_id = None
+                doc.reconciliation_match_percentage = None
+                doc.reconciliation_total_mismatches = None
+                reset_count += 1
+
+        db.commit()
+
+        return {
+            "message": f"Reset {reset_count} documents to ready status",
+            "upload_id": str(upload_id),
+            "reset_count": reset_count
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resetting reconciliation status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

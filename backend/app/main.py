@@ -35,7 +35,9 @@ except ImportError:
 # Our modules
 from .excel_parser_custom import CustomExcelParser as ExcelParser
 from .pdf_processor import PDFProcessor
-from .reconciliation_engine_comprehensive import ComprehensiveReconciliationEngine as ReconciliationEngine, ReconciliationResult
+from .reconciliation_engine_comprehensive import ComprehensiveReconciliationEngine as ReconciliationEngine, ReconciliationResult, CellMismatch
+from .reconciliation_engine_custom_model import CustomModelReconciliationEngine
+from .reconciliation_engine_complete import CompletePositionalReconciliationEngine
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -60,7 +62,10 @@ class Settings(BaseModel):
     # Processing
     MIN_PDF_CONFIDENCE: float = float(os.getenv("MIN_PDF_CONFIDENCE", "0.75"))
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-    
+
+    # Reconciliation Engine Selection
+    USE_CUSTOM_MODEL: bool = os.getenv("USE_CUSTOM_MODEL", "true").lower() == "true"
+
     # File storage
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/tmp/reconciliation_uploads")
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", "/tmp/reconciliation_reports")
@@ -204,6 +209,97 @@ class ReconciliationListResponse(BaseModel):
     pages: int
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def excel_column_letter(col_idx: int) -> str:
+    """Convert column index (0-based) to Excel column letter (A, B, C, ..., Z, AA, AB, ...)"""
+    result = ""
+    col_idx += 1  # Convert to 1-based
+    while col_idx > 0:
+        col_idx -= 1
+        result = chr(col_idx % 26 + ord('A')) + result
+        col_idx //= 26
+    return result
+
+def transform_custom_model_results_to_reconciliation_result(
+    custom_results: dict,
+    reconciliation_id: str,
+    excel_filename: str,
+    pdf_filename: str
+) -> ReconciliationResult:
+    """
+    Transform custom model reconciliation results to ReconciliationResult format
+    expected by the frontend and database
+    """
+    # Extract mismatches from all sections
+    mismatches = []
+
+    for section_name, section_data in custom_results.get("sections", {}).items():
+        if "day_results" in section_data:
+            for day_result in section_data["day_results"]:
+                if day_result.get("mismatched_cells"):
+                    for mismatch_cell in day_result["mismatched_cells"]:
+                        # Excel cell reference is now provided directly
+                        excel_cell_ref = mismatch_cell.get("excel_cell_ref", "Unknown")
+
+                        mismatches.append(CellMismatch(
+                            section=section_name,
+                            field=excel_cell_ref,  # Use Excel cell ref as field
+                            row_identifier=day_result.get("label", f"Day {day_result.get('day')}"),
+                            excel_value=mismatch_cell.get("excel_value"),
+                            pdf_value=mismatch_cell.get("pdf_value"),
+                            excel_cell_ref=excel_cell_ref,
+                            pdf_image_base64=None,
+                            description=f"Excel cell {excel_cell_ref} = '{mismatch_cell.get('excel_value')}' not found in PDF"
+                        ))
+
+    # Create ReconciliationResult
+    result = ReconciliationResult(
+        reconciliation_id=reconciliation_id,
+        timestamp=datetime.now(),
+
+        # ID matching - using placeholder values since custom model doesn't extract header info yet
+        emei_code_match=True,
+        excel_emei="N/A",
+        pdf_emei="N/A",
+        emei_id_excel="N/A",
+        id_match=True,
+
+        # PDF quality - custom model is trusted
+        pdf_confidence_ok=True,
+        pdf_overall_confidence=1.0,
+
+        # Comparison results
+        total_mismatches=custom_results.get("overall_mismatches", 0),
+        total_cells_compared=custom_results.get("overall_cells_compared", 0),
+        mismatches=mismatches,
+
+        # Summary metrics - using placeholder values
+        excel_total_students=0,
+        pdf_total_students=0,
+        excel_row_count=sum(
+            s.get("days_compared", 0)
+            for s in custom_results.get("sections", {}).values()
+        ),
+        pdf_row_count=sum(
+            s.get("days_compared", 0)
+            for s in custom_results.get("sections", {}).values()
+        ),
+        row_count_match=True,
+
+        # File names
+        excel_filename=excel_filename,
+        pdf_filename=pdf_filename,
+
+        # Overall metrics
+        overall_match_percentage=custom_results.get("overall_match_percentage", 0.0),
+        status="match" if custom_results.get("overall_mismatches", 0) == 0 else "mismatch"
+    )
+
+    return result
+
+# ============================================================================
 # BACKGROUND PROCESSING FUNCTION
 # ============================================================================
 
@@ -230,42 +326,34 @@ def process_reconciliation_background(
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
         
-        # Update status: Parsing Excel
-        update_progress(db, reconciliation_id, 15, "Parsing Excel file...")
-        
-        # Parse Excel
-        excel_parser = ExcelParser()
-        excel_data = excel_parser.parse_file(excel_path)
-        
-        logger.info(f"Excel parsed successfully for {reconciliation_id}")
-        
-        # Update status: Processing PDF
-        update_progress(db, reconciliation_id, 40, "Processing PDF with Azure Document Intelligence...")
-        
-        # Process PDF
+        # Update status: Processing with Complete Positional Engine
+        update_progress(db, reconciliation_id, 40, "Processing PDF with positional table-based reconciliation...")
+
+        # Use Complete Positional Reconciliation Engine
         if not settings.AZURE_DI_ENDPOINT or not settings.AZURE_DI_KEY:
             raise ValueError("Azure Document Intelligence credentials not configured")
-        
-        pdf_processor = PDFProcessor(
-            settings.AZURE_DI_ENDPOINT,
-            settings.AZURE_DI_KEY,
-            settings.MIN_PDF_CONFIDENCE
-        )
-        
-        # Run async PDF processing in event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        pdf_data = loop.run_until_complete(pdf_processor.process_pdf(pdf_path))
-        loop.close()
-        
-        logger.info(f"PDF processed successfully for {reconciliation_id}")
-        
+
+        engine = CompletePositionalReconciliationEngine()
+
+        logger.info(f"Complete positional engine initialized for {reconciliation_id}")
+
         # Update status: Reconciling
-        update_progress(db, reconciliation_id, 70, "Comparing Excel and PDF data...")
-        
-        # Run reconciliation
-        engine = ReconciliationEngine(settings.MIN_PDF_CONFIDENCE)
-        result = engine.reconcile(excel_data, pdf_data, reconciliation_id)
+        update_progress(db, reconciliation_id, 70, "Comparing Excel and PDF data (Sections 1, 2, 3)...")
+
+        # Run complete positional reconciliation for all 3 sections
+        custom_results = engine.reconcile_all_sections(pdf_path, excel_path)
+
+        logger.info(f"Positional reconciliation complete for {reconciliation_id}")
+
+        # Transform custom model results to ReconciliationResult format
+        excel_filename = os.path.basename(excel_path)
+        pdf_filename = os.path.basename(pdf_path)
+        result = transform_custom_model_results_to_reconciliation_result(
+            custom_results,
+            reconciliation_id,
+            excel_filename,
+            pdf_filename
+        )
         
         logger.info(f"Reconciliation complete for {reconciliation_id}: {result.total_mismatches} mismatches")
         
@@ -809,6 +897,63 @@ def delete_reconciliation(reconciliation_id: str):
         
     finally:
         db.close()
+
+
+# ============================================================================
+# CUSTOM MODEL RECONCILIATION ENDPOINTS
+# ============================================================================
+
+@app.post("/api/v1/reconciliation/custom-model/test")
+def test_custom_model_reconciliation(
+    pdf_filename: str,
+    excel_filename: str
+):
+    """
+    Test endpoint for custom model reconciliation
+    Uses files from downloaded_pdfs and excel_to_process folders
+    """
+    try:
+        # Construct file paths
+        pdf_path = os.path.join("downloaded_pdfs", pdf_filename)
+        excel_path = os.path.join("excel_to_process", excel_filename)
+
+        # Validate files exist
+        if not os.path.exists(pdf_path):
+            raise HTTPException(status_code=404, detail=f"PDF file not found: {pdf_filename}")
+        if not os.path.exists(excel_path):
+            raise HTTPException(status_code=404, detail=f"Excel file not found: {excel_filename}")
+
+        # Initialize custom model engine
+        engine = CustomModelReconciliationEngine()
+
+        # Define section configurations
+        # For Section2: PDF row 2 (Day 1) -> Excel row 28
+        # For Section3: PDF row 2 (Day 2) -> Excel row 78 (skip validation due to OCR errors)
+        section_configs = [
+            {
+                "section_name": "Section2",
+                "excel_start_row": 28
+            },
+            {
+                "section_name": "Section3",
+                "excel_start_row": 78,
+                "skip_day_validation": True
+            }
+        ]
+
+        # Run reconciliation
+        results = engine.reconcile_all_sections(
+            pdf_path,
+            excel_path,
+            section_configs
+        )
+
+        return results
+
+    except Exception as e:
+        logger.error(f"Custom model reconciliation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ============================================================================
 # RUN SERVER
