@@ -137,22 +137,60 @@ class PositionalReconciliationEngine:
 
         return table, metadata
 
-    def build_pdf_table_structure(self, table: Any, data_start_row: int = 2) -> Dict:
+    def find_day_1_row(self, table: Any, search_start_row: int = 1) -> int:
+        """
+        Find the row index where Day 1 actually starts in the PDF table
+
+        Args:
+            table: PDF table object
+            search_start_row: Row to start searching from (default 1, after title row)
+
+        Returns:
+            Row index where day=1 is found, or search_start_row if not found
+        """
+        for row_idx in range(search_start_row, min(search_start_row + 5, table.row_count)):
+            # Get day column value (column 0)
+            day_val = ""
+            for cell in table.cells:
+                if cell.row_index == row_idx and cell.column_index == 0:
+                    day_val = (cell.content or "").strip()
+                    break
+
+            # Check if this row has day=1
+            if day_val == "1" or day_val == 1:
+                logger.info(f"Found Day 1 at PDF row {row_idx}")
+                return row_idx
+
+        # Default to search_start_row + 1 if not found
+        logger.warning(f"Day 1 not found, defaulting to row {search_start_row + 1}")
+        return search_start_row + 1
+
+    def build_pdf_table_structure(self, table: Any, data_start_row: int = 2, auto_detect_day1: bool = True) -> Dict:
         """
         Build a structured representation of the PDF table
         Args:
             table: PDF table object
             data_start_row: Row index where data starts (default 2 for Section2/3, 1 for Section1)
+            auto_detect_day1: If True, automatically find Day 1 row. If False, use data_start_row as-is.
+                              Set to False for Section 1 which doesn't have day numbers.
         Returns: {
             "rows": [
                 {"row_idx": idx, "day": day_num, "cells": {col_idx: content}},
                 ..
-            ]
+            ],
+            "actual_data_start_row": int  # Where Day 1 actually is
         }
         """
+        # Find where Day 1 actually starts (handles different header row counts)
+        # Only do this for Section 2 and 3 which have day-based rows
+        if auto_detect_day1:
+            actual_data_start = self.find_day_1_row(table, search_start_row=data_start_row - 1)
+        else:
+            actual_data_start = data_start_row
+
         # Extract data rows (skip header rows)
         rows = []
-        for row_idx in range(data_start_row, table.row_count):
+        for row_idx in range(actual_data_start, table.row_count):
             row_data = {"row_idx": row_idx, "cells": {}}
 
             # Get all cells for this row
@@ -174,7 +212,10 @@ class PositionalReconciliationEngine:
 
             rows.append(row_data)
 
-        return {"rows": rows}
+        return {
+            "rows": rows,
+            "actual_data_start_row": actual_data_start
+        }
 
     def load_excel_sheet(self, excel_path: str, sheet_name: str = "EMEI") -> Any:
         """Load Excel sheet"""
@@ -261,7 +302,15 @@ class PositionalReconciliationEngine:
 
         # Extract PDF table
         pdf_table, pdf_metadata = self.extract_table(pdf_path, table_index)
-        pdf_structure = self.build_pdf_table_structure(pdf_table, data_start_row=pdf_data_start_row)
+        pdf_structure = self.build_pdf_table_structure(
+            pdf_table,
+            data_start_row=pdf_data_start_row,
+            auto_detect_day1=(pdf_data_start_row >= 2)  # Only auto-detect for Section 2 & 3 (day-based)
+        )
+
+        # Use the actual detected Day 1 row for calculations
+        actual_pdf_data_start = pdf_structure.get("actual_data_start_row", pdf_data_start_row)
+        logger.info(f"Day 1 detected at PDF row {actual_pdf_data_start} (expected around row {pdf_data_start_row})")
 
         # Load Excel
         ws = self.load_excel_sheet(excel_path)
@@ -290,13 +339,16 @@ class PositionalReconciliationEngine:
 
             day_num = pdf_row["day"]
 
+            # Check if this is the Total row - if so, process it and then stop
+            is_total_row = isinstance(day_num, str) and day_num.lower() == "total"
+
             # Calculate Excel row for this day
             if isinstance(day_num, int):
                 excel_row_idx = excel_start_row + (day_num - 1)
             else:
                 # For Total or other special rows, use positional matching
-                # pdf_data_start_row is where Day 1 starts in PDF (row 2 for Section2, row 3 for Section3)
-                excel_row_idx = excel_start_row + (pdf_row["row_idx"] - pdf_data_start_row)
+                # Use actual_pdf_data_start (detected Day 1 row) instead of pdf_data_start_row parameter
+                excel_row_idx = excel_start_row + (pdf_row["row_idx"] - actual_pdf_data_start)
                 # Add excel_row_skip ONLY for Total row (handles empty rows in Excel like Section1 row 19)
                 if isinstance(day_num, str) and day_num.lower() == "total":
                     excel_row_idx += excel_row_skip
@@ -367,6 +419,11 @@ class PositionalReconciliationEngine:
 
             if day_mismatches > 0:
                 results["mismatched_days"].append(str(day_num))
+
+            # Stop processing after Total row - any rows after Total are not part of the data
+            if is_total_row:
+                logger.info(f"Reached Total row, stopping processing (processed {results['days_compared']} days)")
+                break
 
         # Calculate overall match percentage
         if results["cells_compared"] > 0:
