@@ -12,6 +12,8 @@ from azure.core.credentials import AzureKeyCredential
 from openpyxl import load_workbook
 from dotenv import load_dotenv
 
+from .pdf_cell_image_extractor import PDFCellImageExtractor
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,15 @@ class PositionalReconciliationEngine:
     def __init__(self):
         self.endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
         self.key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
-        self.model_id = "SEM_EMEI_v1"
+
+        # Determine which model to use based on configuration
+        model_type = os.getenv("AZURE_DI_MODEL_TYPE", "prebuilt").lower()
+        if model_type == "custom":
+            self.model_id = os.getenv("CUSTOM_MODEL_NAME", "SEM_EMEI_v1")
+            logger.info(f"Using custom Azure DI model: {self.model_id}")
+        else:
+            self.model_id = "prebuilt-layout"
+            logger.info("Using prebuilt-layout Azure DI model")
 
         if not self.endpoint or not self.key:
             raise ValueError("Azure Document Intelligence credentials not found in environment")
@@ -95,6 +105,11 @@ class PositionalReconciliationEngine:
             endpoint=self.endpoint,
             credential=AzureKeyCredential(self.key)
         )
+
+        # Initialize PDF cell image extractor for mismatch visualization
+        # Using zoom_factor=1.0 for faster processing (was 2.0)
+        self.image_extractor = PDFCellImageExtractor(zoom_factor=1.0)
+        self.extract_images = False  # DISABLED: Set to False to disable image extraction for faster processing
 
     @staticmethod
     def excel_column_letter(col_idx: int) -> str:
@@ -191,12 +206,17 @@ class PositionalReconciliationEngine:
         # Extract data rows (skip header rows)
         rows = []
         for row_idx in range(actual_data_start, table.row_count):
-            row_data = {"row_idx": row_idx, "cells": {}}
+            row_data = {
+                "row_idx": row_idx,
+                "cells": {},
+                "cell_objects": {}  # Store original Azure DI cell objects for image extraction
+            }
 
             # Get all cells for this row
             for cell in table.cells:
                 if cell.row_index == row_idx:
                     row_data["cells"][cell.column_index] = cell.content if cell.content else ""
+                    row_data["cell_objects"][cell.column_index] = cell  # Store cell object
 
             # Get day number from column 0
             day_val = row_data["cells"].get(0, "").strip()
@@ -241,6 +261,7 @@ class PositionalReconciliationEngine:
         1. Empty cells vs :unselected: (both mean unchecked/empty)
         2. Checkbox representations (X/x vs :selected:)
         3. Number formatting (remove thousands separators)
+        4. Values with checkbox markers (e.g., ": 0 :unselected:" → "0")
         """
         if not value or value == "":
             return ""
@@ -249,26 +270,44 @@ class PositionalReconciliationEngine:
         if value == ":unselected:":
             return ""
 
+        # Handle values with :unselected: prefix/suffix (e.g., ": 0 :unselected:" → "0")
+        if ":unselected:" in value:
+            cleaned = value.replace(":unselected:", "").replace(":", "").strip()
+            # If the cleaned value is empty, treat as empty cell
+            if not cleaned:
+                return ""
+            # Otherwise return the cleaned value (e.g., "0")
+            value = cleaned
+
         # Normalize checkbox values
-        if value.upper() == "X":
+        if value.upper().strip() == "X":
             return ":selected:"
 
         # Handle values that contain both content and checkbox markers
-        # e.g., "0 :selected:" or "x :selected:"
+        # e.g., "0 :selected:", "x :selected:", "8 :selected:"
         if ":selected:" in value:
-            # If it's just "x :selected:" or "X :selected:", normalize to :selected:
-            cleaned = value.replace(":selected:", "").strip()
-            if cleaned.upper() == "X" or cleaned == "":
+            # Strip the :selected: marker and any extra colons/spaces
+            cleaned = value.replace(":selected:", "").replace(":", "").strip()
+            # If it's just "x" or "X", normalize to :selected:
+            if cleaned.upper() == "X":
                 return ":selected:"
-            # Otherwise keep the value with :selected:
-            return value
+            # If it's empty after removing :selected:, return :selected:
+            if cleaned == "":
+                return ":selected:"
+            # Otherwise return the cleaned value without the checkbox marker
+            # e.g., "8 :selected:" → "8", "0 :selected:" → "0"
+            value = cleaned
 
-        # Remove thousands separators from numbers in PDF (1.665 → 1665)
-        if "." in value and value.replace(".", "").replace(",", "").isdigit():
-            # Check if it looks like a thousands separator (1.665 not 1.5)
-            parts = value.split(".")
-            if len(parts) == 2 and len(parts[1]) == 3 and parts[1].isdigit():
-                return value.replace(".", "")
+        # AGGRESSIVE number normalization: Remove ALL dots and commas from numbers
+        # This handles: 1.665 → 1665, 4,667 → 4667, 1.234.567 → 1234567, etc.
+        # Works for all sections, not just totals
+        if "." in value or "," in value:
+            # Try removing all dots and commas
+            cleaned_number = value.replace(".", "").replace(",", "")
+            # If the result is all digits, return the cleaned version
+            if cleaned_number.isdigit():
+                return cleaned_number
+            # Otherwise keep the original value (might be a decimal like 1.5)
 
         return value
 
@@ -280,7 +319,8 @@ class PositionalReconciliationEngine:
         excel_start_row: int = 28,
         column_mapping: Dict[int, int] = None,
         pdf_data_start_row: int = 2,
-        excel_row_skip: int = 0
+        excel_row_skip: int = 0,
+        pdf_table: Any = None  # OPTIMIZATION: Pass pre-extracted table to avoid re-analyzing PDF
     ) -> Dict:
         """
         Reconcile a section between PDF table and Excel using positional mapping
@@ -293,6 +333,7 @@ class PositionalReconciliationEngine:
             column_mapping: Dict mapping Excel col idx to PDF col idx
             pdf_data_start_row: PDF row index where Day 1 data starts (1 for Section1, 2 for Section2, 3 for Section3)
             excel_row_skip: Extra offset for Total row (1 for Section1 due to empty row 19)
+            pdf_table: Optional pre-extracted PDF table object (avoids re-analyzing PDF)
 
         Returns:
             Dictionary with reconciliation results
@@ -300,8 +341,18 @@ class PositionalReconciliationEngine:
         if column_mapping is None:
             column_mapping = SECTION2_EXCEL_TO_PDF_MAPPING
 
-        # Extract PDF table
-        pdf_table, pdf_metadata = self.extract_table(pdf_path, table_index)
+        # Extract PDF table (or use provided one)
+        if pdf_table is not None:
+            # Use pre-extracted table (optimization to avoid redundant Azure DI API calls)
+            pdf_metadata = {
+                "row_count": pdf_table.row_count,
+                "column_count": pdf_table.column_count,
+                "table_index": table_index
+            }
+            logger.info(f"Using pre-extracted PDF table (avoiding redundant API call)")
+        else:
+            # Extract table from PDF (backward compatibility)
+            pdf_table, pdf_metadata = self.extract_table(pdf_path, table_index)
         pdf_structure = self.build_pdf_table_structure(
             pdf_table,
             data_start_row=pdf_data_start_row,
@@ -384,13 +435,27 @@ class PositionalReconciliationEngine:
                     col_letter = self.excel_column_letter(excel_col_idx)
                     excel_cell_ref = f"{col_letter}{excel_row_idx}"
 
+                    # Extract PDF cell image for mismatch visualization (if enabled)
+                    pdf_image_base64 = None
+                    if self.extract_images:
+                        try:
+                            cell_obj = pdf_row.get("cell_objects", {}).get(pdf_col_idx)
+                            if cell_obj:
+                                pdf_image_base64 = self.image_extractor.extract_cell_image_from_azure_cell(
+                                    pdf_path=pdf_path,
+                                    cell=cell_obj
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to extract PDF cell image: {e}")
+
                     mismatched_cells.append({
                         "excel_column": excel_col_idx,
                         "excel_cell_ref": excel_cell_ref,
                         "excel_value": excel_str if excel_str != "" else "(empty)",
                         "pdf_column": pdf_col_idx,
                         "pdf_value": pdf_str if pdf_str != "" else "(empty)",
-                        "excel_row": excel_row_idx
+                        "excel_row": excel_row_idx,
+                        "pdf_image_base64": pdf_image_base64
                     })
 
             results["days_compared"] += 1

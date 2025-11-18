@@ -62,6 +62,9 @@ function BulkUpload() {
   // Error handling
   const [error, setError] = useState<string | null>(null);
 
+  // Selection state
+  const [selectedDocuments, setSelectedDocuments] = useState<Set<string>>(new Set());
+
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const excelInputRef = useRef<HTMLInputElement>(null);
 
@@ -334,6 +337,89 @@ function BulkUpload() {
   const extractedDocuments = documents.filter((d) => d.status === 'extracted');
   const matchedCount = documents.filter((d) => d.excel_matched).length;
 
+  // Selection handlers
+  const handleSelectAll = () => {
+    if (selectedDocuments.size === documents.length) {
+      // Unselect all
+      setSelectedDocuments(new Set());
+    } else {
+      // Select all (use document_id, not id)
+      setSelectedDocuments(new Set(documents.map(d => d.document_id)));
+    }
+  };
+
+  const handleSelectDocument = (docId: string) => {
+    const newSelected = new Set(selectedDocuments);
+    if (newSelected.has(docId)) {
+      newSelected.delete(docId);
+    } else {
+      newSelected.add(docId);
+    }
+    setSelectedDocuments(newSelected);
+  };
+
+  const handleSelectValid = () => {
+    const validDocIds = documents
+      .filter(d => d.excel_matched)
+      .map(d => d.document_id);  // Use document_id, not id
+    setSelectedDocuments(new Set(validDocIds));
+  };
+
+  const handleProcessSelected = async () => {
+    if (!uploadId || selectedDocuments.size === 0) return;
+
+    try {
+      setReconciling(true);
+      setError(null);
+
+      // Convert selected document IDs to array
+      const documentIds = Array.from(selectedDocuments);
+
+      // Start reconciliation for selected documents only
+      const response = await bulkApi.startReconciliation(uploadId, documentIds);
+      console.log(
+        `Reconciliação iniciada para ${response.document_count} documento(s) selecionado(s)`
+      );
+
+      // Poll for document status updates
+      const pollInterval = setInterval(async () => {
+        try {
+          const docs = await bulkApi.getDocuments(uploadId);
+          setDocuments(docs);
+
+          // Check if all selected documents are completed or failed
+          const selectedDocs = docs.filter((d) => documentIds.includes(d.document_id));
+          const stillProcessing = selectedDocs.some(
+            (d) => d.status === 'reconciling' || d.reconciliation_status === 'processing'
+          );
+
+          if (!stillProcessing) {
+            clearInterval(pollInterval);
+            setReconciling(false);
+            setReconciliationComplete(true);
+
+            // Clear selection after processing
+            setSelectedDocuments(new Set());
+          }
+        } catch (err) {
+          console.error('Erro ao verificar status da reconciliação:', err);
+          clearInterval(pollInterval);
+          setReconciling(false);
+          setError('Erro ao verificar status da reconciliação.');
+        }
+      }, 3000); // Poll every 3 seconds
+    } catch (err) {
+      console.error('Erro ao iniciar reconciliação dos selecionados:', err);
+      setError('Erro ao iniciar reconciliação dos documentos selecionados. Tente novamente.');
+      setReconciling(false);
+    }
+  };
+
+  // Count stats
+  const validPagesCount = documents.filter(d => d.page_count === 2).length;
+  const invalidPagesCount = documents.filter(d => d.page_count !== 2).length;
+  const excelMatchedCount = documents.filter(d => d.excel_matched).length;
+
   return (
     <div className="space-y-8">
       {/* Progress Steps */}
@@ -576,10 +662,35 @@ function BulkUpload() {
             </div>
           </div>
 
+          {/* Bulk Action Buttons */}
+          <div className="flex items-center space-x-3 mb-4">
+            <button
+              onClick={handleSelectValid}
+              className="px-4 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors text-sm"
+            >
+              Selecionar Válidos
+            </button>
+            <button
+              onClick={handleProcessSelected}
+              disabled={selectedDocuments.size === 0}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors text-sm"
+            >
+              Processar Selecionados ({selectedDocuments.size})
+            </button>
+          </div>
+
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead className="bg-gray-50 border-b border-gray-200">
                 <tr>
+                  <th className="px-4 py-3 text-center">
+                    <input
+                      type="checkbox"
+                      checked={selectedDocuments.size === documents.length && documents.length > 0}
+                      onChange={handleSelectAll}
+                      className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+                    />
+                  </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                     ID
                   </th>
@@ -619,6 +730,14 @@ function BulkUpload() {
               <tbody className="bg-white divide-y divide-gray-200">
                 {documents.map((doc) => (
                   <tr key={doc.id} className="hover:bg-gray-50">
+                    <td className="px-4 py-3 text-center">
+                      <input
+                        type="checkbox"
+                        checked={selectedDocuments.has(doc.document_id)}
+                        onChange={() => handleSelectDocument(doc.document_id)}
+                        className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+                      />
+                    </td>
                     <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">
                       {doc.document_id}
                     </td>
@@ -724,6 +843,22 @@ function BulkUpload() {
                 ))}
               </tbody>
             </table>
+          </div>
+
+          {/* Legend */}
+          <div className="mt-4 flex items-center space-x-6 text-sm">
+            <div className="flex items-center space-x-2">
+              <div className="w-3 h-3 bg-green-500 rounded-full"></div>
+              <span className="text-gray-700">Páginas válidas ({validPagesCount})</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <div className="w-3 h-3 bg-red-500 rounded-full"></div>
+              <span className="text-gray-700">Páginas inválidas ({invalidPagesCount})</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <CheckCircle2 className="w-4 h-4 text-green-500" />
+              <span className="text-gray-700">Excel correspondido ({excelMatchedCount})</span>
+            </div>
           </div>
         </div>
       )}
@@ -953,7 +1088,7 @@ function BulkUpload() {
                         Células Comparadas
                       </p>
                       <p className="text-3xl font-bold text-blue-600 mt-2">
-                        {selectedReconciliation.total_cells_compared || 0}
+                        {selectedReconciliation.overall_cells_compared || 0}
                       </p>
                     </div>
                     <div className="bg-blue-100 rounded-full p-3">
