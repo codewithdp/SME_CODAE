@@ -439,18 +439,18 @@ class PositionalReconciliationEngine:
                     if column_names:
                         col_name = column_names.get(excel_col_idx)
 
-                    # Normalize values for display (convert :unselected: to empty)
+                    # Display normalized values (convert empty to "(empty)" for clarity)
                     def display_value(val):
-                        if val == "" or val == ":unselected:":
+                        if val == "":
                             return "(empty)"
                         return val
 
                     mismatched_cells.append({
                         "excel_column": excel_col_idx,
                         "excel_cell_ref": excel_cell_ref,
-                        "excel_value": display_value(excel_str),
+                        "excel_value": display_value(excel_normalized),
                         "pdf_column": pdf_col_idx,
-                        "pdf_value": display_value(pdf_str),
+                        "pdf_value": display_value(pdf_normalized),
                         "excel_row": excel_row_idx,
                         "pdf_image_base64": pdf_image_base64,
                         "column_name": col_name
