@@ -141,9 +141,17 @@ export const PDFViewer: React.FC<PDFViewerProps> = ({ uploadId, documentId }) =>
         const containerCenterX = containerWidth / 2;
         const containerCenterY = containerHeight / 2;
 
+        // Convert box center from screen coordinates to PDF coordinates
+        // Screen position = PDF position * scale + panOffset
+        // So: PDF position = (Screen position - panOffset) / scale
+        const pdfBoxCenterX = (boxCenterX - panOffset.x) / scale;
+        const pdfBoxCenterY = (boxCenterY - panOffset.y) / scale;
+
+        // Calculate new pan offset to center this PDF position at new scale
+        // containerCenter = pdfCenter * newScale + newPanOffset
         setPanOffset({
-          x: (containerCenterX - boxCenterX) * newScale,
-          y: (containerCenterY - boxCenterY) * newScale
+          x: containerCenterX - pdfBoxCenterX * newScale,
+          y: containerCenterY - pdfBoxCenterY * newScale
         });
       }
 
