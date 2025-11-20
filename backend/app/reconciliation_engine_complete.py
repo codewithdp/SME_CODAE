@@ -13,7 +13,10 @@ from .reconciliation_engine_positional import (
     PositionalReconciliationEngine,
     SECTION1_EXCEL_TO_PDF_MAPPING,
     SECTION2_EXCEL_TO_PDF_MAPPING,
-    SECTION3_EXCEL_TO_PDF_MAPPING
+    SECTION3_EXCEL_TO_PDF_MAPPING,
+    SECTION1_COLUMN_NAMES,
+    SECTION2_COLUMN_NAMES,
+    SECTION3_COLUMN_NAMES
 )
 
 load_dotenv()
@@ -28,30 +31,22 @@ class CompletePositionalReconciliationEngine:
         self.positional_engine = PositionalReconciliationEngine()
         self.azure_di_endpoint = os.getenv('AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT')
         self.azure_di_key = os.getenv('AZURE_DOCUMENT_INTELLIGENCE_KEY')
-        self.model_id = "SEM_EMEI_v1"
-        logger.info("CompletePositionalReconciliationEngine initialized")
 
-    def detect_section_tables(self, pdf_path: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        # Use same model configuration as positional engine
+        self.model_id = self.positional_engine.model_id
+        logger.info(f"CompletePositionalReconciliationEngine initialized with model: {self.model_id}")
+
+    def _detect_section_tables_from_result(self, result) -> Tuple[Optional[int], Optional[int], Optional[int]]:
         """
-        Detect which table index corresponds to Section 1, 2, and 3
+        Detect which table index corresponds to Section 1, 2, and 3 from an existing Azure DI result
+
+        Args:
+            result: Azure Document Intelligence analysis result
 
         Returns:
             Tuple of (section1_index, section2_index, section3_index)
         """
-        logger.info(f"Detecting section tables for {pdf_path}")
-
-        client = DocumentIntelligenceClient(
-            self.azure_di_endpoint,
-            credential=AzureKeyCredential(self.azure_di_key)
-        )
-
-        with open(pdf_path, "rb") as f:
-            poller = client.begin_analyze_document(
-                self.model_id,
-                analyze_request=f,
-                content_type="application/pdf"
-            )
-            result = poller.result()
+        logger.info(f"Detecting section tables from cached PDF analysis result")
 
         section1_idx = None
         section2_idx = None
@@ -119,8 +114,26 @@ class CompletePositionalReconciliationEngine:
             "overall_match_percentage": 0.0
         }
 
-        # Detect which table index corresponds to which section
-        section1_idx, section2_idx, section3_idx = self.detect_section_tables(pdf_path)
+        # OPTIMIZATION: Analyze PDF once and cache the result to avoid 4 separate API calls
+        logger.info(f"Analyzing PDF with Azure Document Intelligence (this may take 30-90 seconds)...")
+        client = DocumentIntelligenceClient(
+            self.azure_di_endpoint,
+            credential=AzureKeyCredential(self.azure_di_key)
+        )
+
+        with open(pdf_path, "rb") as f:
+            poller = client.begin_analyze_document(
+                self.model_id,
+                analyze_request=f,
+                content_type="application/pdf",
+                features=[]  # Disable image extraction for faster processing
+            )
+            pdf_analysis_result = poller.result()
+
+        logger.info(f"PDF analysis complete, found {len(pdf_analysis_result.tables)} tables")
+
+        # Detect which table index corresponds to which section using the cached result
+        section1_idx, section2_idx, section3_idx = self._detect_section_tables_from_result(pdf_analysis_result)
 
         # Section 1 configuration
         if section1_idx is not None:
@@ -132,8 +145,10 @@ class CompletePositionalReconciliationEngine:
                     table_index=section1_idx,
                     excel_start_row=15,  # INTEGRAL row
                     column_mapping=SECTION1_EXCEL_TO_PDF_MAPPING,
+                    column_names=SECTION1_COLUMN_NAMES,
                     pdf_data_start_row=1,  # Data starts at row 1
-                    excel_row_skip=1  # Skip empty row 19 before Total
+                    excel_row_skip=1,  # Skip empty row 19 before Total
+                    pdf_table=pdf_analysis_result.tables[section1_idx]  # Use cached table
                 )
                 overall_results["sections"]["Section1"] = section1_results
                 overall_results["overall_cells_compared"] += section1_results["cells_compared"]
@@ -169,7 +184,9 @@ class CompletePositionalReconciliationEngine:
                     table_index=section2_idx,
                     excel_start_row=28,  # Day 1 row
                     column_mapping=SECTION2_EXCEL_TO_PDF_MAPPING,
-                    pdf_data_start_row=2  # Data starts at row 2
+                    column_names=SECTION2_COLUMN_NAMES,
+                    pdf_data_start_row=2,  # Data starts at row 2
+                    pdf_table=pdf_analysis_result.tables[section2_idx]  # Use cached table
                 )
                 overall_results["sections"]["Section2"] = section2_results
                 overall_results["overall_cells_compared"] += section2_results["cells_compared"]
@@ -205,7 +222,9 @@ class CompletePositionalReconciliationEngine:
                     table_index=section3_idx,
                     excel_start_row=77,  # Day 1 row
                     column_mapping=SECTION3_EXCEL_TO_PDF_MAPPING,
-                    pdf_data_start_row=3  # Data starts at row 3
+                    column_names=SECTION3_COLUMN_NAMES,
+                    pdf_data_start_row=3,  # Data starts at row 3
+                    pdf_table=pdf_analysis_result.tables[section3_idx]  # Use cached table
                 )
                 overall_results["sections"]["Section3"] = section3_results
                 overall_results["overall_cells_compared"] += section3_results["cells_compared"]

@@ -10,10 +10,12 @@
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
   },
   "dependencies": {
+    "axios": "^1.7.9",
+    "lucide-react": "^0.344.0",
+    "pdfjs-dist": "^5.4.394",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "axios": "^1.7.9",
-    "lucide-react": "^0.344.0"
+    "react-pdf": "^10.2.0"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, Text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Session, sessionmaker, declarative_base
@@ -27,8 +27,6 @@ from .bulk_models import (
     ReconciliationProgressResponse
 )
 from .bulk_pdf_processor import BulkPDFProcessor
-from .blob_storage_service import BlobStorageService
-from .reconciliation_engine_comprehensive import ComprehensiveReconciliationEngine
 from .excel_parser_custom import CustomExcelParser
 from .pdf_processor import PDFProcessor
 from .main import ReconciliationDB
@@ -126,18 +124,33 @@ router = APIRouter(prefix="/api/v1/bulk", tags=["Bulk Upload"])
 # SERVICES INITIALIZATION
 # ============================================================================
 
-def get_blob_service():
-    """Get Azure Blob Storage service"""
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    container_name = os.getenv("AZURE_STORAGE_CONTAINER_NAME", "bulk-uploads")
-    return BlobStorageService(connection_string, container_name)
+def get_local_storage_path(upload_id: UUID, subfolder: str = "", filename: str = "") -> str:
+    """
+    Get local storage path for bulk upload files
+
+    Structure: /tmp/bulk_uploads/{year-month}/{upload_id}/{subfolder}/{filename}
+    """
+    base_dir = os.getenv("BULK_UPLOAD_DIR", "/tmp/bulk_uploads")
+    upload_folder = f"{datetime.now().strftime('%Y-%m')}/{upload_id}"
+
+    if subfolder:
+        full_path = os.path.join(base_dir, upload_folder, subfolder)
+    else:
+        full_path = os.path.join(base_dir, upload_folder)
+
+    # Create directory if it doesn't exist
+    os.makedirs(full_path, exist_ok=True)
+
+    if filename:
+        return os.path.join(full_path, filename)
+    return full_path
 
 
 def get_pdf_processor():
     """Get Bulk PDF Processor"""
     endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
     key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
-    model_id = os.getenv("CUSTOM_MODEL_ID", "Header_extraction")
+    model_id = os.getenv("CUSTOM_MODEL_ID", "Header_extraction2")
     return BulkPDFProcessor(endpoint, key, model_id)
 
 
@@ -154,7 +167,6 @@ async def process_bulk_pdf_background(
     Background task to process combined PDF
     """
     db = SessionLocal()
-    blob_service = get_blob_service()
     pdf_processor = get_pdf_processor()
 
     try:
@@ -168,22 +180,18 @@ async def process_bulk_pdf_background(
 
         logger.info(f"Starting background processing for upload {upload_id}")
 
-        # Step 1: Upload original PDF to blob storage
+        # Step 1: Save original PDF to local storage
         upload.progress_percentage = 10
-        upload.current_step = "Fazendo upload do PDF..."
+        upload.current_step = "Salvando PDF..."
         db.commit()
 
-        blob_folder = f"{datetime.now().strftime('%Y-%m')}/{upload_id}"
-        original_blob_path = blob_service.upload_file(
-            file_data=io.BytesIO(pdf_content),
-            blob_name=f"{blob_folder}/original.pdf",
-            content_type="application/pdf",
-            metadata={"upload_id": str(upload_id), "filename": original_filename}
-        )
-        logger.info(f"Uploaded original PDF to: {original_blob_path}")
+        original_pdf_path = get_local_storage_path(upload_id, filename="original.pdf")
+        with open(original_pdf_path, 'wb') as f:
+            f.write(pdf_content)
+        logger.info(f"Saved original PDF to: {original_pdf_path}")
 
-        # Update blob path
-        upload.blob_path = original_blob_path
+        # Update blob path (now stores local path)
+        upload.blob_path = original_pdf_path
         upload.progress_percentage = 20
         upload.current_step = "Analisando documento com Azure AI..."
         db.commit()
@@ -206,17 +214,14 @@ async def process_bulk_pdf_background(
         saved_count = 0
 
         for doc in result.documents:
-            # Upload individual PDF to blob
-            doc_blob_path = blob_service.upload_file(
-                file_data=io.BytesIO(doc.pdf_content),
-                blob_name=f"{blob_folder}/split/{doc.document_id}.pdf",
-                content_type="application/pdf",
-                metadata={
-                    "upload_id": str(upload_id),
-                    "document_id": doc.document_id,
-                    "page_count": str(doc.page_count)
-                }
+            # Save individual PDF to local storage
+            doc_local_path = get_local_storage_path(
+                upload_id,
+                subfolder="split",
+                filename=f"{doc.document_id}.pdf"
             )
+            with open(doc_local_path, 'wb') as f:
+                f.write(doc.pdf_content)
 
             # Save to database
             db_doc = BulkDocument(
@@ -232,7 +237,7 @@ async def process_bulk_pdf_background(
                 prestador=doc.prestador,
                 page_count=doc.page_count,
                 page_numbers=json.dumps(doc.page_numbers),
-                pdf_blob_path=doc_blob_path,
+                pdf_blob_path=doc_local_path,  # Now stores local path instead of blob path
                 extraction_confidence=doc.confidence,
                 status="extracted"
             )
@@ -370,6 +375,18 @@ async def get_upload_status(
     if not upload:
         raise HTTPException(status_code=404, detail="Upload not found")
 
+    # Check for zombie jobs (stuck in processing for > 10 minutes)
+    if upload.status == "processing":
+        processing_start = upload.processing_started_at or upload.upload_timestamp
+        time_elapsed = datetime.now() - processing_start
+
+        # If processing for more than 10 minutes, mark as failed
+        if time_elapsed.total_seconds() > 600:
+            upload.status = "failed"
+            upload.error_message = "Processing timed out. Backend may have been restarted. Please try again or cancel this upload."
+            upload.updated_at = datetime.now()
+            db.commit()
+
     # Get progress from database or calculate based on status
     progress = upload.progress_percentage or 0
     if upload.status == "completed":
@@ -395,6 +412,40 @@ async def get_upload_status(
         current_step=current_step,
         error_message=upload.error_message
     )
+
+
+@router.delete("/{upload_id}/cancel")
+async def cancel_upload(
+    upload_id: UUID,
+    db: Session = Depends(get_db)
+):
+    """
+    Cancel or reset a stuck upload
+
+    Use this when:
+    - Backend was restarted during processing
+    - Upload is stuck in "processing" state
+    - You want to retry the upload
+    """
+    upload = db.query(BulkUpload).filter(BulkUpload.id == upload_id).first()
+
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    # Reset to failed state so user can retry
+    upload.status = "cancelled"
+    upload.progress_percentage = 0
+    upload.current_step = "Cancelled by user"
+    upload.error_message = "Upload cancelled manually"
+    upload.updated_at = datetime.now()
+
+    db.commit()
+
+    return {
+        "message": "Upload cancelled successfully",
+        "upload_id": str(upload_id),
+        "status": "cancelled"
+    }
 
 
 @router.get("/{upload_id}/documents", response_model=List[BulkDocumentResponse])
@@ -588,9 +639,6 @@ async def upload_excel_files(
     # Create document ID lookup
     doc_map = {doc.document_id: doc for doc in documents}
 
-    blob_service = get_blob_service()
-    blob_folder = f"{datetime.now().strftime('%Y-%m')}/{upload_id}/excel"
-
     matched_count = 0
     matched_ids = []
 
@@ -612,20 +660,18 @@ async def upload_excel_files(
                 # Read file content
                 content = await file.read()
 
-                # Upload to blob storage
-                excel_blob_path = blob_service.upload_file(
-                    file_data=io.BytesIO(content),
-                    blob_name=f"{blob_folder}/{file.filename}",
-                    content_type="application/vnd.ms-excel",
-                    metadata={
-                        "upload_id": str(upload_id),
-                        "document_id": file_base
-                    }
+                # Save to local storage
+                excel_local_path = get_local_storage_path(
+                    upload_id,
+                    subfolder="excel",
+                    filename=file.filename
                 )
+                with open(excel_local_path, 'wb') as f:
+                    f.write(content)
 
                 # Update document record
                 doc.excel_filename = file.filename
-                doc.excel_blob_path = excel_blob_path
+                doc.excel_blob_path = excel_local_path  # Now stores local path
                 doc.excel_matched = True
                 doc.excel_uploaded_at = datetime.now()
                 doc.status = "ready"  # Ready for reconciliation
@@ -743,14 +789,7 @@ def process_batch_reconciliation(upload_id: str, document_ids: List[str]):
     try:
         logger.info(f"Starting batch reconciliation for upload {upload_id}, {len(document_ids)} documents")
 
-        # Initialize blob storage and services
-        connection_string = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
-        blob_service = BlobStorageService(connection_string, 'bulk-uploads')
-
         # Initialize Complete Positional Reconciliation Engine (Sections 1, 2, 3)
-        azure_di_endpoint = os.getenv('AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT')
-        azure_di_key = os.getenv('AZURE_DOCUMENT_INTELLIGENCE_KEY')
-
         from .reconciliation_engine_complete import CompletePositionalReconciliationEngine
         from .main import transform_custom_model_results_to_reconciliation_result
 
@@ -776,21 +815,26 @@ def process_batch_reconciliation(upload_id: str, document_ids: List[str]):
                     db.commit()
                     continue
 
-                # Download PDF and Excel from blob storage
-                pdf_content = blob_service.download_file(doc.pdf_blob_path)
-                excel_content = blob_service.download_file(doc.excel_blob_path)
+                # Files are already stored locally - use paths directly
+                pdf_path = doc.pdf_blob_path  # Now a local path
+                excel_path = doc.excel_blob_path  # Now a local path
 
-                # Save temporarily
-                temp_dir = f"/tmp/bulk_recon_{upload_id}"
-                os.makedirs(temp_dir, exist_ok=True)
+                # Verify files exist
+                if not os.path.exists(pdf_path):
+                    logger.error(f"PDF file not found: {pdf_path}")
+                    doc.status = "failed"
+                    doc.reconciliation_status = "failed"
+                    doc.error_message = f"PDF file not found at {pdf_path}"
+                    db.commit()
+                    continue
 
-                pdf_path = os.path.join(temp_dir, f"{doc_id}.pdf")
-                excel_path = os.path.join(temp_dir, f"{doc_id}.xlsm")
-
-                with open(pdf_path, 'wb') as f:
-                    f.write(pdf_content)
-                with open(excel_path, 'wb') as f:
-                    f.write(excel_content)
+                if not os.path.exists(excel_path):
+                    logger.error(f"Excel file not found: {excel_path}")
+                    doc.status = "failed"
+                    doc.reconciliation_status = "failed"
+                    doc.error_message = f"Excel file not found at {excel_path}"
+                    db.commit()
+                    continue
 
                 # Run custom model reconciliation
                 section_configs = [
@@ -831,9 +875,7 @@ def process_batch_reconciliation(upload_id: str, document_ids: List[str]):
                 doc.reconciliation_total_mismatches = result.total_mismatches
                 doc.status = "completed"
 
-                # Clean up temp files
-                os.remove(pdf_path)
-                os.remove(excel_path)
+                # Files are stored permanently in local storage, no cleanup needed
 
                 db.commit()
                 logger.info(f"✅ Completed reconciliation for {doc_id}: {result.overall_match_percentage:.2f}% match")
@@ -844,12 +886,6 @@ def process_batch_reconciliation(upload_id: str, document_ids: List[str]):
                 doc.reconciliation_status = "failed"
                 doc.error_message = str(e)
                 db.commit()
-
-        # Clean up temp directory
-        try:
-            os.rmdir(temp_dir)
-        except:
-            pass
 
         logger.info(f"✅ Batch reconciliation complete for upload {upload_id}")
 
@@ -920,4 +956,46 @@ async def reset_reconciliation_status(
         raise
     except Exception as e:
         logger.error(f"Error resetting reconciliation status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{upload_id}/pdf/{document_id}")
+async def get_document_pdf(
+    upload_id: str,
+    document_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Serve split PDF file for visual validation
+    """
+    try:
+        # Get document from database to find PDF path
+        doc = db.query(BulkDocument).filter(
+            BulkDocument.bulk_upload_id == upload_id,
+            BulkDocument.document_id == document_id
+        ).first()
+
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if not doc.pdf_blob_path:
+            raise HTTPException(status_code=404, detail="PDF file not found")
+
+        # Check if file exists
+        if not os.path.exists(doc.pdf_blob_path):
+            raise HTTPException(status_code=404, detail=f"PDF file not found at {doc.pdf_blob_path}")
+
+        # Serve the PDF file for inline display (not download)
+        return FileResponse(
+            path=doc.pdf_blob_path,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="{document_id}.pdf"'
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving PDF: {e}")
         raise HTTPException(status_code=500, detail=str(e))

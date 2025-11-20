@@ -20,10 +20,10 @@ function App() {
               </div>
               <div>
                 <h1 className="text-xl font-bold text-gray-900">
-                  Sistema de Reconciliação EMEI
+                  MERCI
                 </h1>
                 <p className="text-xs text-gray-500">
-                  Secretaria Municipal de Educação - SME
+                  Merenda Escolar, Reconciliação e Controle Integrado
                 </p>
               </div>
             </div>

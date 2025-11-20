@@ -35,7 +35,7 @@ except ImportError:
 # Our modules
 from .excel_parser_custom import CustomExcelParser as ExcelParser
 from .pdf_processor import PDFProcessor
-from .reconciliation_engine_comprehensive import ComprehensiveReconciliationEngine as ReconciliationEngine, ReconciliationResult, CellMismatch
+from .reconciliation_models import ReconciliationResult, CellMismatch
 from .reconciliation_engine_custom_model import CustomModelReconciliationEngine
 from .reconciliation_engine_complete import CompletePositionalReconciliationEngine
 
@@ -250,6 +250,7 @@ def transform_custom_model_results_to_reconciliation_result(
                             excel_value=mismatch_cell.get("excel_value"),
                             pdf_value=mismatch_cell.get("pdf_value"),
                             excel_cell_ref=excel_cell_ref,
+                            column_name=mismatch_cell.get("column_name"),
                             pdf_image_base64=None,
                             description=f"Excel cell {excel_cell_ref} = '{mismatch_cell.get('excel_value')}' not found in PDF"
                         ))

@@ -81,6 +81,61 @@ SECTION3_EXCEL_TO_PDF_MAPPING = {
     16: 7,  # Q: Lanche (6h) (GRUPO B)
 }
 
+# Column name mappings - Excel column index to human-readable name
+SECTION1_COLUMN_NAMES = {
+    11: "Nº Alunos Matriculados",
+    17: "Dieta Especial - A",
+    21: "Dieta Especial - B",
+}
+
+SECTION2_COLUMN_NAMES = {
+    4: "Frequência (INTEGRAL)",
+    6: "Lanche 4h",
+    7: "Lanche 6h",
+    9: "Refeição",
+    10: "Repetição Refeição",
+    11: "Sobremesa",
+    12: "Repetição Sobremesa",
+    13: "2ª Refeição",
+    14: "Repetição 2ª Refeição",
+    15: "2ª Sobremesa",
+    16: "Repetição 2ª Sobremesa",
+    17: "Frequência (1º PERÍODO)",
+    19: "Lanche 4h (1º)",
+    20: "Lanche 6h (1º)",
+    23: "Refeição (1º)",
+    27: "Repetição Refeição (1º)",
+    30: "Sobremesa (1º)",
+    34: "Repetição Sobremesa (1º)",
+    36: "Frequência (INTERMEDIÁRIO)",
+    37: "Lanche 4h (INT)",
+    38: "Refeição (INT)",
+    40: "Repetição Refeição (INT)",
+    42: "Sobremesa (INT)",
+    44: "Repetição Sobremesa (INT)",
+    46: "Frequência (3º PERÍODO)",
+    48: "Lanche 4h (3º)",
+    50: "Lanche 6h (3º)",
+    56: "Refeição (3º)",
+    60: "Repetição Refeição (3º)",
+    61: "Sobremesa (3º)",
+    68: "Repetição Sobremesa (3º)",
+    69: "INTEGRAL (checkbox)",
+    72: "1º PERÍODO (checkbox)",
+    73: "INTERMEDIÁRIO (checkbox)",
+    74: "3º PERÍODO (checkbox)",
+}
+
+SECTION3_COLUMN_NAMES = {
+    3: "Frequência (GRUPO A)",
+    5: "Lanche 4h (GRUPO A)",
+    7: "Lanche 6h (GRUPO A)",
+    10: "Refeição Dieta Enteral (A)",
+    12: "Frequência (GRUPO B)",
+    14: "Lanche 4h (GRUPO B)",
+    16: "Lanche 6h (GRUPO B)",
+}
+
 
 class PositionalReconciliationEngine:
     """Reconciliation engine using fixed positional column mapping"""
@@ -318,6 +373,7 @@ class PositionalReconciliationEngine:
         table_index: int = 2,
         excel_start_row: int = 28,
         column_mapping: Dict[int, int] = None,
+        column_names: Dict[int, str] = None,
         pdf_data_start_row: int = 2,
         excel_row_skip: int = 0,
         pdf_table: Any = None  # OPTIMIZATION: Pass pre-extracted table to avoid re-analyzing PDF
@@ -448,14 +504,26 @@ class PositionalReconciliationEngine:
                         except Exception as e:
                             logger.warning(f"Failed to extract PDF cell image: {e}")
 
+                    # Get column name if available
+                    col_name = None
+                    if column_names:
+                        col_name = column_names.get(excel_col_idx)
+
+                    # Normalize values for display (convert :unselected: to empty)
+                    def display_value(val):
+                        if val == "" or val == ":unselected:":
+                            return "(empty)"
+                        return val
+
                     mismatched_cells.append({
                         "excel_column": excel_col_idx,
                         "excel_cell_ref": excel_cell_ref,
-                        "excel_value": excel_str if excel_str != "" else "(empty)",
+                        "excel_value": display_value(excel_str),
                         "pdf_column": pdf_col_idx,
-                        "pdf_value": pdf_str if pdf_str != "" else "(empty)",
+                        "pdf_value": display_value(pdf_str),
                         "excel_row": excel_row_idx,
-                        "pdf_image_base64": pdf_image_base64
+                        "pdf_image_base64": pdf_image_base64,
+                        "column_name": col_name
                     })
 
             results["days_compared"] += 1

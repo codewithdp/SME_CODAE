@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { bulkApi } from './api/bulkApi';
 import { BulkUploadStatus, BulkDocument } from './types';
+import { PDFViewer } from './PDFViewer';
 
 interface FileInfo {
   file: File;
@@ -325,10 +326,11 @@ function BulkUpload() {
 
     const grouped: Record<string, any[]> = {};
     selectedReconciliation.result_data.mismatches.forEach((mismatch: any) => {
-      if (!grouped[mismatch.section]) {
-        grouped[mismatch.section] = [];
+      const section = mismatch.section || 'Mismatches';
+      if (!grouped[section]) {
+        grouped[section] = [];
       }
-      grouped[mismatch.section].push(mismatch);
+      grouped[section].push(mismatch);
     });
     return grouped;
   };
@@ -1218,6 +1220,9 @@ function BulkUpload() {
                                         Dia/Período
                                       </th>
                                       <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                        Coluna Excel
+                                      </th>
+                                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                                         Célula Excel
                                       </th>
                                       <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -1238,12 +1243,15 @@ function BulkUpload() {
                                           {mismatch.field}
                                         </td>
                                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
-                                          {mismatch.row_identifier || mismatch.day_or_period || '-'}
+                                          {mismatch.row_label || mismatch.row_identifier || mismatch.day_or_period || '-'}
+                                        </td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
+                                          {mismatch.column_name || '-'}
                                         </td>
                                         <td className="px-6 py-4 whitespace-nowrap text-sm font-mono">
-                                          {mismatch.excel_cell_ref ? (
+                                          {mismatch.excel_cell || mismatch.excel_cell_ref ? (
                                             <span className="px-2 py-1 bg-green-100 text-green-800 rounded font-semibold">
-                                              {mismatch.excel_cell_ref}
+                                              {mismatch.excel_cell || mismatch.excel_cell_ref}
                                             </span>
                                           ) : (
                                             <span className="text-gray-400">-</span>
@@ -1294,6 +1302,17 @@ function BulkUpload() {
                   <p className="text-sm text-green-700 mt-2">
                     Não foram encontradas divergências entre o Excel e o PDF.
                   </p>
+                </div>
+              )}
+
+              {/* PDF Viewer Section */}
+              {selectedReconciliation && uploadId && (
+                <div className="mt-6">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-4">Visualizador PDF</h3>
+                  <PDFViewer
+                    uploadId={uploadId}
+                    documentId={selectedReconciliation.document_id}
+                  />
                 </div>
               )}
             </div>

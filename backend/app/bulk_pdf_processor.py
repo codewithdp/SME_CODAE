@@ -180,7 +180,8 @@ class BulkPDFProcessor:
             poller = self.client.begin_analyze_document(
                 model_id=self.custom_model_id,
                 analyze_request=page_bytes.read(),
-                content_type="application/pdf"
+                content_type="application/pdf",
+                features=[]  # Disable image extraction for faster processing
             )
             result = poller.result()
 

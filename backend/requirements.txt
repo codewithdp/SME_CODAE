@@ -24,5 +24,9 @@ azure-storage-blob==12.19.0
 # PDF Manipulation (for splitting/combining PDFs)
 PyPDF2==3.0.1
 
+# PDF Image Extraction and Processing
+PyMuPDF==1.23.8
+Pillow==10.1.0
+
 # Utilities
 python-dotenv==1.0.0
