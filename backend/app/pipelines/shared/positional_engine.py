@@ -280,6 +280,25 @@ class PositionalReconciliationEngine:
         if value == "0" or value == "-":
             return ""
 
+        # OCR error normalization for numeric values
+        # Common confusions: 1/I/l, 0/O, 5/S, 6/G
+        ocr_map = {
+            'I': '1', 'l': '1',  # I and l → 1
+            'O': '0',            # O → 0
+            'S': '5',            # S → 5
+            'G': '6', 'b': '6',  # G and b → 6
+            'D': '0',            # D → 0
+            'Z': '2',            # Z → 2
+        }
+        if len(value) <= 3:  # Only for short values (likely numbers)
+            ocr_cleaned = ''.join(ocr_map.get(c, c) for c in value)
+            if ocr_cleaned.isdigit():
+                value = ocr_cleaned
+
+        # Re-check for "0" after OCR normalization (e.g., "D" → "0" → "")
+        if value == "0":
+            return ""
+
         # AGGRESSIVE number normalization: Remove ALL dots and commas from numbers
         # This handles: 1.665 → 1665, 4,667 → 4667, 1.234.567 → 1234567, etc.
         # Works for all sections, not just totals

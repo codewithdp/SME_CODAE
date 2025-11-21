@@ -70,18 +70,18 @@ class CEIReconciliationEngine:
 
             logger.debug(f"Table {idx}: Page {page_num}, {rows}x{cols}")
 
-            # Page 1, Table 2: ~11-12 rows x 7 columns
-            if page_num == 1 and 10 <= rows <= 13 and cols == 7:
+            # Page 1, Table 2: ~11-12 rows x 6-7 columns
+            if page_num == 1 and 10 <= rows <= 13 and 6 <= cols <= 7:
                 table2_page1_idx = idx
                 logger.info(f"Found Table 2 (Page 1) at index {idx}: {rows}x{cols}")
 
-            # Page 1, Table 3: ~35 rows x 17-18 columns
+            # Page 1, Table 3: ~35 rows x 17-19 columns
             elif page_num == 1 and 33 <= rows <= 37 and 16 <= cols <= 19:
                 table3_page1_idx = idx
                 logger.info(f"Found Table 3 (Page 1) at index {idx}: {rows}x{cols}")
 
-            # Page 2, Table 1: ~34-39 rows x 32 columns
-            elif page_num == 2 and 32 <= rows <= 40 and cols == 32:
+            # Page 2, Table 1: ~34-39 rows x 30-32 columns
+            elif page_num == 2 and 32 <= rows <= 40 and 30 <= cols <= 32:
                 table1_page2_idx = idx
                 logger.info(f"Found Table 1 (Page 2) at index {idx}: {rows}x{cols}")
 
@@ -178,24 +178,52 @@ class CEIReconciliationEngine:
         # =================================================================
         # Reconcile Table 2 (Page 1) - Section 1A: Enrolled students
         # Excel range: Y16:DG24
+        # First data cell: Y16 (N° Matriculados Integral)
         # =================================================================
         if table2_p1_idx is not None:
             logger.info("Reconciling Table 2 (Page 1) - Section 1A...")
 
-            # Convert relative mappings to absolute
-            abs_mapping = self._convert_relative_to_absolute_mapping(
-                TABLE2_PAGE1_EXCEL_TO_PDF_MAPPING, "Y"
-            )
+            table2 = pdf_analysis_result.tables[table2_p1_idx]
+
+            # Build sequential mapping based on first data cell Y16
+            # PDF structure: col 0=Faixa Etária (labels), then data columns
+            # For 7-col table: cols 1-6 = Integral(N°), Parcial(N°), Integral(A), Parcial(A), Integral(B), Parcial(B)
+            # For 6-col table: cols 1-5 = one column is missing
+
+            logger.info(f"Table 2 has {table2.row_count} rows x {table2.column_count} columns")
+
+            # Y = col 24 (absolute), so start_col_idx = 24
+            # Build mapping: Excel absolute col -> PDF col
+            # Sequential from first data cell (Y -> PDF col 1)
+            if table2.column_count == 7:
+                # Standard 7-col table
+                abs_mapping = {
+                    24: 1,   # Y (rel 0): N° Matriculados Integral
+                    43: 2,   # AR (rel 19): N° Matriculados Parcial
+                    94: 5,   # CQ (rel 70): Dieta Especial Tipo B Integral
+                }
+            else:
+                # 6-col table - adjust mapping (assume last col is missing)
+                abs_mapping = {
+                    24: 1,   # Y (rel 0): N° Matriculados Integral
+                    43: 2,   # AR (rel 19): N° Matriculados Parcial
+                    94: table2.column_count - 2,  # CQ: second to last col
+                }
+                logger.info(f"Adjusted mapping for {table2.column_count}-col table: CQ -> col {table2.column_count - 2}")
+
             abs_names = self._convert_relative_to_absolute_names(
                 TABLE2_PAGE1_COLUMN_NAMES, "Y"
             )
 
-            # Adjust for extra rows - expected 11 rows, if more, skip extra at top
-            table2 = pdf_analysis_result.tables[table2_p1_idx]
-            extra_rows = max(0, table2.row_count - 11)
-            pdf_data_start = 2 + extra_rows  # Skip header rows (0, 1) plus any extra
-            if extra_rows > 0:
-                logger.info(f"Table 2 has {table2.row_count} rows (expected 11), skipping {extra_rows} extra row(s)")
+            # Find first data row by looking for "0 a 1" in column 0 (first age group)
+            pdf_data_start = 2  # default
+            for cell in table2.cells:
+                if cell.column_index == 0 and cell.content:
+                    content = cell.content.strip().lower()
+                    if "0 a 1" in content or "0a1" in content:
+                        pdf_data_start = cell.row_index
+                        logger.info(f"Found first data row at {pdf_data_start}: '{cell.content.strip()}'")
+                        break
 
             section1_result = self.positional_engine.reconcile_section(
                 pdf_path=pdf_path,
@@ -225,10 +253,46 @@ class CEIReconciliationEngine:
         if table3_p1_idx is not None:
             logger.info("Reconciling Table 3 (Page 1) - Section 2...")
 
-            # Convert relative mappings to absolute
-            abs_mapping = self._convert_relative_to_absolute_mapping(
-                TABLE3_PAGE1_EXCEL_TO_PDF_MAPPING, "M"
-            )
+            table3 = pdf_analysis_result.tables[table3_p1_idx]
+
+            # Build sequential mapping based on data cell positions
+            # First data cell M31 -> PDF col 1 (after DIA at col 0)
+            # INTEGRAL: cols 1-7 (fixed, 7 data columns)
+            # OBSERVAÇÕES: col 8 (may span multiple columns)
+            # PARCIAL: starts after OBSERVAÇÕES span
+
+            logger.info(f"Table 3 has {table3.column_count} columns")
+
+            # Find OBSERVAÇÕES span to determine where PARCIAL starts
+            # Look at Day 1 data row (find row where col 0 = "1")
+            obs_span = 1  # default
+            for cell in table3.cells:
+                if cell.column_index == 8:
+                    # Check if this is a data row (not header)
+                    row_cells = {c.column_index: c for c in table3.cells if c.row_index == cell.row_index}
+                    if row_cells.get(0) and row_cells[0].content and row_cells[0].content.strip() == "1":
+                        obs_span = cell.column_span if hasattr(cell, 'column_span') and cell.column_span else 1
+                        break
+
+            parcial_start = 8 + obs_span  # PARCIAL starts after OBSERVAÇÕES
+            logger.info(f"OBSERVAÇÕES span={obs_span}, PARCIAL starts at col {parcial_start}")
+
+            # Build mapping sequentially from first data cell
+            # Excel col (abs) -> PDF col
+            # M = col 12, so rel + 12 = abs
+            abs_mapping = {
+                # INTEGRAL (cols 1-7, sequential from col 1)
+                15: 2,   # P (rel 3): 01 a 03 M
+                18: 3,   # S (rel 6): 04 a 05 M
+                21: 4,   # V (rel 9): 6 M
+                24: 5,   # Y (rel 12): 07 a 11 M
+                27: 6,   # AB (rel 15): 01 a 03 anos e 11 meses
+                30: 7,   # AE (rel 18): 04 a 06 anos
+                # PARCIAL (sequential from parcial_start)
+                84: parcial_start + 5,  # CI (rel 72): 01 a 03 anos e 11 meses
+                87: parcial_start + 6,  # CL (rel 75): 04 a 06 anos
+            }
+
             abs_names = self._convert_relative_to_absolute_names(
                 TABLE3_PAGE1_COLUMN_NAMES, "M"
             )
@@ -242,7 +306,7 @@ class CEIReconciliationEngine:
                 column_names=abs_names,
                 pdf_data_start_row=2,  # Day-based table, auto-detect day 1
                 excel_row_skip=0,
-                pdf_table=pdf_analysis_result.tables[table3_p1_idx],
+                pdf_table=table3,
                 sheet_name="CEI"
             )
 
@@ -260,29 +324,62 @@ class CEIReconciliationEngine:
         if table1_p2_idx is not None:
             logger.info("Reconciling Table 1 (Page 2) - Section 3...")
 
-            # Convert relative mappings to absolute
-            abs_mapping = self._convert_relative_to_absolute_mapping(
-                TABLE1_PAGE2_EXCEL_TO_PDF_MAPPING, "M"
-            )
+            table1_p2 = pdf_analysis_result.tables[table1_p2_idx]
+
+            # Build sequential mapping based on data cell positions
+            # M71 is first data cell (Day 1, col 0 a 1 M)
+            # Structure: col 0=DIA, then 4 sections of 7 cols each
+            # Section 1: cols 1-7, Section 2: cols 8-14, Section 3: cols 15-21, Section 4: cols 22-28
+
+            logger.info(f"Table 1 (Page 2) has {table1_p2.row_count} rows x {table1_p2.column_count} columns")
+
+            # Build mapping sequentially (M = col 12, so rel + 12 = abs)
+            abs_mapping = {
+                # Section 1 (cols 1-7) - no 0a1M in Excel
+                15: 2,   # rel 3: 01 a 03 M
+                18: 3,   # rel 6: 04 a 05 M
+                21: 4,   # rel 9: 6 M
+                24: 5,   # rel 12: 07 a 11 M
+                27: 6,   # rel 15: 01 a 03 anos e 11 meses
+                30: 7,   # rel 18: 04 a 06 anos
+
+                # Section 2 (cols 8-14) - has 0a1M at col 8
+                34: 8,   # rel 22: 0 a 1 M
+                37: 9,   # rel 25: 01 a 03 M
+                40: 10,  # rel 28: 04 a 05 M
+                43: 11,  # rel 31: 6 M
+                46: 12,  # rel 34: 07 a 11 M
+                49: 13,  # rel 37: 01 a 03 anos e 11 meses
+                53: 14,  # rel 41: 04 a 06 anos
+
+                # Section 3 (cols 15-21) - partial section in Excel
+                69: 19,  # rel 57: 07 a 11 M
+                72: 20,  # rel 60: 01 a 03 anos e 11 meses
+                75: 21,  # rel 63: 04 a 06 anos
+
+                # Section 4 (cols 22-28) - has 0a1M at col 22
+                78: 22,  # rel 66: 0 a 1 M
+                81: 23,  # rel 69: 01 a 03 M
+                84: 24,  # rel 72: 04 A 05 M
+                87: 25,  # rel 75: 6 M
+                91: 26,  # rel 79: 07 a 11 M
+                94: 27,  # rel 82: 01 a 03 anos e 11 meses
+            }
+
             abs_names = self._convert_relative_to_absolute_names(
                 TABLE1_PAGE2_COLUMN_NAMES, "M"
             )
 
             # Adjust for varying header rows based on table size
-            # Expected: 32 data rows (days 1-31 + total)
-            # 34 rows = 2 header rows (0,1), data at row 2
-            # 36 rows = 4 header rows (0,1,2,3), data at row 4
-            # 37 rows = 4 header rows + 1 extra after Total, data at row 4
-            table1_p2 = pdf_analysis_result.tables[table1_p2_idx]
             row_count = table1_p2.row_count
             if row_count == 34:
-                pdf_data_start = 2  # 2 header rows (row 0=doc info, row 1=headers), Day 1 at row 2
+                pdf_data_start = 2  # 2 header rows, Day 1 at row 2
             elif row_count >= 36:
                 pdf_data_start = 4  # 4 header rows, Day 1 at row 4
             else:
-                pdf_data_start = max(2, row_count - 32)  # Fallback: total rows - 32 data rows
+                pdf_data_start = max(2, row_count - 32)
 
-            logger.info(f"Table 1 (Page 2) has {row_count} rows, data starts at row {pdf_data_start}")
+            logger.info(f"Data starts at row {pdf_data_start}")
 
             section3_result = self.positional_engine.reconcile_section(
                 pdf_path=pdf_path,
