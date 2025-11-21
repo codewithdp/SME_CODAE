@@ -84,12 +84,13 @@ TABLE1_PAGE2_EXCEL_TO_PDF_MAPPING = {
     # Note: Column 0 (DIA) is outside the data range, skip it
 
     # First section - similar to Table 3 INTEGRAL
-    3: 1,
-    6: 2,
-    9: 3,
-    12: 4,
-    15: 5,
-    18: 6,
+    # PDF col 1 is "0 a 1 M" which is not in this Excel section
+    3: 2,   # 01 a 03 M
+    6: 3,   # 04 a 05 M
+    9: 4,   # 6 M
+    12: 5,  # 07 a 11 M
+    15: 6,  # 01 a 03 anos e 11 meses
+    18: 7,  # 04 a 06 anos
     19: 7,
     20: 8,
     21: 9,

@@ -70,18 +70,18 @@ class CEIReconciliationEngine:
 
             logger.debug(f"Table {idx}: Page {page_num}, {rows}x{cols}")
 
-            # Page 1, Table 2: 11 rows x 7 columns
-            if page_num == 1 and rows == 11 and cols == 7:
+            # Page 1, Table 2: ~11-12 rows x 7 columns
+            if page_num == 1 and 10 <= rows <= 13 and cols == 7:
                 table2_page1_idx = idx
                 logger.info(f"Found Table 2 (Page 1) at index {idx}: {rows}x{cols}")
 
-            # Page 1, Table 3: 35 rows x 18 columns
-            elif page_num == 1 and rows == 35 and cols == 18:
+            # Page 1, Table 3: ~35 rows x 17-18 columns
+            elif page_num == 1 and 33 <= rows <= 37 and 16 <= cols <= 19:
                 table3_page1_idx = idx
                 logger.info(f"Found Table 3 (Page 1) at index {idx}: {rows}x{cols}")
 
-            # Page 2, Table 1: ~37 rows x 32 columns (allow 35-39 rows for flexibility)
-            elif page_num == 2 and 35 <= rows <= 39 and cols == 32:
+            # Page 2, Table 1: ~34-39 rows x 32 columns
+            elif page_num == 2 and 32 <= rows <= 40 and cols == 32:
                 table1_page2_idx = idx
                 logger.info(f"Found Table 1 (Page 2) at index {idx}: {rows}x{cols}")
 
@@ -190,6 +190,13 @@ class CEIReconciliationEngine:
                 TABLE2_PAGE1_COLUMN_NAMES, "Y"
             )
 
+            # Adjust for extra rows - expected 11 rows, if more, skip extra at top
+            table2 = pdf_analysis_result.tables[table2_p1_idx]
+            extra_rows = max(0, table2.row_count - 11)
+            pdf_data_start = 2 + extra_rows  # Skip header rows (0, 1) plus any extra
+            if extra_rows > 0:
+                logger.info(f"Table 2 has {table2.row_count} rows (expected 11), skipping {extra_rows} extra row(s)")
+
             section1_result = self.positional_engine.reconcile_section(
                 pdf_path=pdf_path,
                 excel_path=excel_path,
@@ -197,10 +204,11 @@ class CEIReconciliationEngine:
                 excel_start_row=16,  # Row 16 = "0 a 1 mês" (empty)
                 column_mapping=abs_mapping,
                 column_names=abs_names,
-                pdf_data_start_row=2,  # Skip header rows (0, 1)
+                pdf_data_start_row=pdf_data_start,  # Skip header rows plus any extra
                 excel_row_skip=0,  # No skip needed - Total at row 24
-                pdf_table=pdf_analysis_result.tables[table2_p1_idx],
-                sheet_name="CEI"
+                pdf_table=table2,
+                sheet_name="CEI",
+                auto_detect_day1=False  # Section 1 has age ranges, not days
             )
 
             overall_results["sections"]["section1_table2_p1"] = section1_result
@@ -260,6 +268,22 @@ class CEIReconciliationEngine:
                 TABLE1_PAGE2_COLUMN_NAMES, "M"
             )
 
+            # Adjust for varying header rows based on table size
+            # Expected: 32 data rows (days 1-31 + total)
+            # 34 rows = 2 header rows (0,1), data at row 2
+            # 36 rows = 4 header rows (0,1,2,3), data at row 4
+            # 37 rows = 4 header rows + 1 extra after Total, data at row 4
+            table1_p2 = pdf_analysis_result.tables[table1_p2_idx]
+            row_count = table1_p2.row_count
+            if row_count == 34:
+                pdf_data_start = 2  # 2 header rows (row 0=doc info, row 1=headers), Day 1 at row 2
+            elif row_count >= 36:
+                pdf_data_start = 4  # 4 header rows, Day 1 at row 4
+            else:
+                pdf_data_start = max(2, row_count - 32)  # Fallback: total rows - 32 data rows
+
+            logger.info(f"Table 1 (Page 2) has {row_count} rows, data starts at row {pdf_data_start}")
+
             section3_result = self.positional_engine.reconcile_section(
                 pdf_path=pdf_path,
                 excel_path=excel_path,
@@ -267,9 +291,9 @@ class CEIReconciliationEngine:
                 excel_start_row=71,  # M71 starts at row 71
                 column_mapping=abs_mapping,
                 column_names=abs_names,
-                pdf_data_start_row=2,  # Day-based table
+                pdf_data_start_row=pdf_data_start,
                 excel_row_skip=0,
-                pdf_table=pdf_analysis_result.tables[table1_p2_idx],
+                pdf_table=table1_p2,
                 sheet_name="CEI"
             )
 

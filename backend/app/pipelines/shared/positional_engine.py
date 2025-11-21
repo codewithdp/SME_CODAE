@@ -293,6 +293,161 @@ class PositionalReconciliationEngine:
 
         return value
 
+    def extract_pdf_headers(self, table: Any, header_rows: int = 2) -> Dict[int, str]:
+        """
+        Extract column headers from PDF table
+
+        Args:
+            table: PDF table object
+            header_rows: Number of header rows to check (default 2)
+
+        Returns:
+            Dict mapping column index to header text
+        """
+        headers = {}
+
+        for cell in table.cells:
+            if cell.row_index < header_rows:
+                col_idx = cell.column_index
+                content = (cell.content or "").strip()
+
+                # Combine headers from multiple rows if they exist
+                if col_idx in headers:
+                    if content and content not in headers[col_idx]:
+                        headers[col_idx] = f"{headers[col_idx]} {content}".strip()
+                else:
+                    headers[col_idx] = content
+
+        return headers
+
+    @staticmethod
+    def normalize_header(text: str) -> str:
+        """Normalize header text for comparison"""
+        if not text:
+            return ""
+        # Lowercase, remove extra whitespace, normalize common variations
+        normalized = text.lower().strip()
+
+        # Remove checkbox markers and data that gets mixed into headers
+        normalized = normalized.replace(":selected:", "").replace(":unselected:", "")
+
+        # Remove standalone numbers that are likely data values (not part of age groups)
+        # Keep numbers that are part of patterns like "01 a 03" but remove standalone "2"
+        import re
+        # Remove numbers at end of string (likely data values)
+        normalized = re.sub(r'\s+\d+$', '', normalized)
+        # Remove numbers at start that aren't part of age patterns
+        normalized = re.sub(r'^\d+\s+(?![a])', '', normalized)
+
+        normalized = " ".join(normalized.split())  # Collapse whitespace
+
+        # Remove common accent variations
+        normalized = normalized.replace("á", "a").replace("é", "e").replace("ã", "a")
+        normalized = normalized.replace("ç", "c").replace("ô", "o").replace("ê", "e")
+        return normalized
+
+    def calculate_header_similarity(self, header1: str, header2: str) -> float:
+        """
+        Calculate similarity between two headers
+        Returns value between 0 and 1
+        Handles OCR word reordering (e.g., "01 a 03 anos e 11 meses" vs "e 11 meses 01 a 03 anos")
+        """
+        h1 = self.normalize_header(header1)
+        h2 = self.normalize_header(header2)
+
+        if not h1 or not h2:
+            return 0.0
+
+        if h1 == h2:
+            return 1.0
+
+        # Check word set equality (handles reordered words from OCR)
+        words1 = set(h1.split())
+        words2 = set(h2.split())
+
+        if words1 == words2:
+            return 1.0  # Same words, different order = perfect match
+
+        # Check if one contains the other
+        if h1 in h2 or h2 in h1:
+            return 0.8
+
+        # Check word overlap ratio
+        if words1 and words2:
+            overlap = len(words1 & words2)
+            total = len(words1 | words2)
+            similarity = overlap / total if total > 0 else 0.0
+            # Boost score if most words match
+            if similarity >= 0.8:
+                return 0.9
+            return similarity
+
+        return 0.0
+
+    def build_dynamic_column_mapping(
+        self,
+        pdf_table: Any,
+        excel_column_names: Dict[int, str],
+        base_mapping: Dict[int, int],
+        header_rows: int = 2
+    ) -> Dict[int, int]:
+        """
+        Build dynamic column mapping by matching PDF headers to Excel headers
+
+        Args:
+            pdf_table: PDF table object
+            excel_column_names: Dict mapping Excel col idx to header name
+            base_mapping: Original positional mapping to use as fallback
+            header_rows: Number of PDF header rows
+
+        Returns:
+            Adjusted column mapping
+        """
+        pdf_headers = self.extract_pdf_headers(pdf_table, header_rows)
+
+        if not pdf_headers:
+            logger.warning("No PDF headers found, using base mapping")
+            return base_mapping
+
+        logger.info(f"Building dynamic mapping from {len(excel_column_names)} Excel headers to {len(pdf_headers)} PDF columns")
+
+        dynamic_mapping = {}
+        unmatched_excel = []
+
+        for excel_col, excel_header in excel_column_names.items():
+            if not excel_header:  # Skip empty headers
+                # Use base mapping for empty headers
+                if excel_col in base_mapping:
+                    dynamic_mapping[excel_col] = base_mapping[excel_col]
+                continue
+
+            # Find best matching PDF column
+            best_match_col = None
+            best_match_score = 0.0
+
+            for pdf_col, pdf_header in pdf_headers.items():
+                score = self.calculate_header_similarity(excel_header, pdf_header)
+                if score > best_match_score:
+                    best_match_score = score
+                    best_match_col = pdf_col
+
+            if best_match_score >= 0.5:  # Minimum threshold for match
+                dynamic_mapping[excel_col] = best_match_col
+                logger.debug(f"Matched Excel col {excel_col} '{excel_header}' -> PDF col {best_match_col} (score: {best_match_score:.2f})")
+            else:
+                # Fall back to base mapping
+                if excel_col in base_mapping:
+                    dynamic_mapping[excel_col] = base_mapping[excel_col]
+                    logger.debug(f"No match for '{excel_header}', using base mapping: {excel_col} -> {base_mapping[excel_col]}")
+                else:
+                    unmatched_excel.append(excel_col)
+
+        if unmatched_excel:
+            logger.warning(f"Unmatched Excel columns: {unmatched_excel}")
+
+        logger.info(f"Dynamic mapping complete: {len(dynamic_mapping)} columns mapped")
+        return dynamic_mapping
+
     def reconcile_section(
         self,
         pdf_path: str,
@@ -304,7 +459,10 @@ class PositionalReconciliationEngine:
         pdf_data_start_row: int = 2,
         excel_row_skip: int = 0,
         pdf_table: Any = None,  # OPTIMIZATION: Pass pre-extracted table to avoid re-analyzing PDF
-        sheet_name: str = "EMEI"  # Sheet name pattern to search for
+        sheet_name: str = "EMEI",  # Sheet name pattern to search for
+        use_dynamic_mapping: bool = False,  # Enable dynamic header-based mapping
+        dynamic_header_rows: int = None,  # Explicit header rows for dynamic mapping
+        auto_detect_day1: bool = None  # Auto-detect Day 1 row (None=auto based on data_start)
     ) -> Dict:
         """
         Reconcile a section between PDF table and Excel using positional mapping
@@ -339,10 +497,12 @@ class PositionalReconciliationEngine:
         else:
             # Extract table from PDF (backward compatibility)
             pdf_table, pdf_metadata = self.extract_table(pdf_path, table_index)
+        # Determine auto_detect_day1: use explicit param if set, otherwise heuristic
+        should_detect_day1 = auto_detect_day1 if auto_detect_day1 is not None else (pdf_data_start_row >= 2)
         pdf_structure = self.build_pdf_table_structure(
             pdf_table,
             data_start_row=pdf_data_start_row,
-            auto_detect_day1=(pdf_data_start_row >= 2)  # Only auto-detect for Section 2 & 3 (day-based)
+            auto_detect_day1=should_detect_day1
         )
 
         # Use the actual detected Day 1 row for calculations
@@ -352,7 +512,20 @@ class PositionalReconciliationEngine:
         # Load Excel
         ws = self.load_excel_sheet(excel_path, sheet_name=sheet_name)
 
-        logger.info(f"Using fixed column mapping: {len(column_mapping)} columns mapped")
+        # Use dynamic mapping if explicitly enabled and column_names provided
+        # This handles OCR variations like word reordering in headers
+        if use_dynamic_mapping and column_names:
+            # Use explicit header_rows if provided, otherwise use pdf_data_start_row
+            header_rows = dynamic_header_rows if dynamic_header_rows else pdf_data_start_row
+            column_mapping = self.build_dynamic_column_mapping(
+                pdf_table,
+                column_names,
+                column_mapping,
+                header_rows=header_rows
+            )
+            logger.info(f"Using dynamic column mapping: {len(column_mapping)} columns mapped (header_rows={header_rows})")
+        else:
+            logger.info(f"Using fixed column mapping: {len(column_mapping)} columns mapped")
 
         # Reconciliation results
         results = {
